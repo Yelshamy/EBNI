@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Floorplan → Three.js</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  html,body{margin:0;height:100%;background:#0e0f12;color:#eaeaea;font-family:system-ui,Segoe UI,Roboto,Arial;}
+  #app{position:fixed;inset:0;display:flex;flex-direction:column}
+  header{display:flex;gap:.6rem;align-items:center;padding:.6rem .9rem;background:#14161a;border-bottom:1px solid #262a31;font-size:14px;flex-wrap:wrap}
+  header .btn, header label{background:#1b1f27;color:#dfe3ea;border:1px solid #2b3240;border-radius:8px;padding:.4rem .6rem;cursor:pointer;font-size:13px}
+  header .btn:hover, header label:hover{background:#232834}
+  .row{display:flex;gap:.6rem;align-items:center}
+  input[type="file"]{display:none}
+  #canvas{position:relative;flex:1;min-height:0}
+  #overlayText{position:absolute;left:12px;bottom:10px;font-size:12px;color:#b8c0cc;opacity:.9;background:rgba(0,0,0,.35);padding:.3rem .5rem;border-radius:6px}
+  .slider{accent-color:#60a5fa}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="row">
+      <label for="drop">Open… (GLB / GeoJSON / PNG)</label>
+      <input id="drop" type="file" multiple accept=".glb,.gltf,.geojson,.json,.png,.jpg,.jpeg"/>
+      <button class="btn" id="fit">Frame</button>
+      <button class="btn" id="toggleGrid">Grid</button>
+      <button class="btn" id="toggleAxes">Axes</button>
+    </div>
+    <div class="row" style="gap:1rem">
+      <div class="row">
+        <span style="opacity:.8">Wall height</span>
+        <input id="wallHeight" type="range" min="1" max="6" step="0.1" value="3" class="slider"/>
+        <span id="whVal">3.0 m</span>
+      </div>
+      <div class="row">
+        <span style="opacity:.8">Pixel → meter</span>
+        <input id="pxScale" type="range" min="0.002" max="0.05" step="0.001" value="0.01" class="slider"/>
+        <span id="pxVal">0.010 m/px</span>
+      </div>
+    </div>
+  </header>
+  <div id="canvas"></div>
+  <div id="overlayText">Drop GLB / GeoJSON / Image • Drag to orbit • Shift+Drag to pan • Wheel to zoom</div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+let PIXEL_TO_METER = 0.01;          // live-controlled
+let DEFAULT_WALL_HEIGHT = 3.0;      // live-controlled
+
+const container = document.getElementById('canvas');
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e0f12);
+const camera = new THREE.PerspectiveCamera(55, container.clientWidth/container.clientHeight, 0.01, 5000);
+camera.position.set(6,6,6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 0.6); scene.add(hemi);
+const key  = new THREE.DirectionalLight(0xffffff, 0.9); key.position.set(5,10,8); scene.add(key);
+
+let grid = new THREE.GridHelper(50,50,0x334155,0x1f2937); grid.material.transparent=true; grid.material.opacity=.6; scene.add(grid);
+let axes = new THREE.AxesHelper(1.2); axes.visible=false; scene.add(axes);
+
+const worldGroup = new THREE.Group();  // walls (GLB or extruded)
+const floorGroup = new THREE.Group();  // optional image plane
+scene.add(worldGroup, floorGroup);
+
+const fitBtn = document.getElementById('fit');
+const gridBtn = document.getElementById('toggleGrid');
+const axesBtn = document.getElementById('toggleAxes');
+const fileInput = document.getElementById('drop');
+
+const wh = document.getElementById('wallHeight');
+const whVal = document.getElementById('whVal');
+const px = document.getElementById('pxScale');
+const pxVal = document.getElementById('pxVal');
+
+wh.oninput = ()=> { DEFAULT_WALL_HEIGHT = parseFloat(wh.value); whVal.textContent = `${DEFAULT_WALL_HEIGHT.toFixed(1)} m`; reExtrudeIfGeoJSON(); }
+px.oninput = ()=> { PIXEL_TO_METER = parseFloat(px.value); pxVal.textContent = `${PIXEL_TO_METER.toFixed(3)} m/px`; reExtrudeIfGeoJSON(); }
+
+const gltfLoader = new GLTFLoader();
+
+function clearGroup(g){
+  for (let i=g.children.length-1;i>=0;i--){
+    const c=g.children[i];
+    c.traverse?.(o=>{
+      if (o.isMesh) {
+        o.geometry?.dispose?.();
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats?.forEach(m=>{ m?.map?.dispose?.(); m?.dispose?.(); });
+      }
+    });
+    g.remove(c);
+  }
+}
+function centerAndLift(g){
+  const box = new THREE.Box3().setFromObject(g);
+  const size = new THREE.Vector3(); const center = new THREE.Vector3();
+  box.getSize(size); box.getCenter(center);
+  g.position.x += -center.x; g.position.z += -center.z; g.position.y += -box.min.y;
+}
+function frameScene(pad=1.2){
+  const box = new THREE.Box3().setFromObject(worldGroup);
+  if (box.isEmpty()) return;
+  const size = new THREE.Vector3(); const center = new THREE.Vector3();
+  box.getSize(size); box.getCenter(center);
+  const radius = Math.max(size.x,size.y,size.z)*0.5*pad;
+  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov)/2);
+  camera.position.copy(center.clone().add(new THREE.Vector3(dist, dist*0.6, dist)));
+  controls.target.copy(center); controls.update();
+}
+
+async function loadGLB(file){
+  const url = URL.createObjectURL(file);
+  const gltf = await gltfLoader.loadAsync(url); URL.revokeObjectURL(url);
+  clearGroup(worldGroup);
+  const root = gltf.scene || gltf.scenes[0];
+  root.traverse(o=>{ if (o.isMesh){ o.castShadow=false; o.receiveShadow=true; if (o.material){ o.material.roughness=.92; o.material.metalness=0; } }});
+  worldGroup.userData.type = 'glb';
+  worldGroup.add(root);
+  centerAndLift(worldGroup); frameScene();
+}
+async function loadFloorImage(file){
+  const url = URL.createObjectURL(file);
+  const img = await new Promise((res,rej)=>{const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=url;});
+  URL.revokeObjectURL(url);
+  const w_m = img.width*PIXEL_TO_METER, h_m = img.height*PIXEL_TO_METER;
+  clearGroup(floorGroup);
+  const tex = new THREE.Texture(img); tex.colorSpace=THREE.SRGBColorSpace; tex.needsUpdate=true;
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(w_m,h_m), new THREE.MeshBasicMaterial({map:tex,transparent:true,opacity:.75,side:THREE.DoubleSide}));
+  plane.rotation.x = -Math.PI/2; plane.position.y=.001;
+  floorGroup.add(plane); frameScene();
+}
+let lastGeoJSON = null; // keep last for live re-extrude
+async function loadGeoJSON(file){
+  const text = await file.text(); lastGeoJSON = JSON.parse(text);
+  extrudeGeoJSON(lastGeoJSON); frameScene();
+}
+function extrudeGeoJSON(gj){
+  clearGroup(worldGroup);
+  worldGroup.userData.type = 'geojson';
+
+  const features = gj.type==='FeatureCollection' ? gj.features : [{geometry: gj}];
+  for (const f of features){
+    const geom = f.geometry;
+    if (!geom) continue;
+
+    const polys = [];
+    if (geom.type==='Polygon') polys.push(geom.coordinates);
+    else if (geom.type==='MultiPolygon') polys.push(...geom.coordinates);
+    else continue;
+
+    for (const poly of polys){
+      const mesh = extrudePoly(poly);
+      if (mesh) worldGroup.add(mesh);
+    }
+  }
+  centerAndLift(worldGroup);
+}
+function extrudePoly(coords){
+  try{
+    const [ext, ...holes] = coords;
+    const shape = new THREE.Shape();
+    for (let i=0;i<ext.length;i++){
+      const [x,y] = ext[i];
+      const X=x*PIXEL_TO_METER, Z=y*PIXEL_TO_METER;
+      if (i===0) shape.moveTo(X,-Z); else shape.lineTo(X,-Z);
+    }
+    for (const hole of holes){
+      const path = new THREE.Path();
+      for (let i=0;i<hole.length;i++){
+        const [x,y] = hole[i];
+        const X=x*PIXEL_TO_METER, Z=y*PIXEL_TO_METER;
+        if (i===0) path.moveTo(X,-Z); else path.lineTo(X,-Z);
+      }
+      shape.holes.push(path);
+    }
+    const geom = new THREE.ExtrudeGeometry(shape, {depth: DEFAULT_WALL_HEIGHT, bevelEnabled:false});
+    geom.rotateX(-Math.PI/2);
+    const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({color:0xbfc6d1, roughness:.92, metalness:0}));
+    mesh.castShadow=false; mesh.receiveShadow=true;
+    return mesh;
+  }catch(e){ console.warn("Extrude error:", e); return null; }
+}
+function reExtrudeIfGeoJSON(){
+  if (worldGroup.userData.type==='geojson' && lastGeoJSON){
+    extrudeGeoJSON(lastGeoJSON); frameScene();
+  }
+}
+
+/* UI */
+document.getElementById('fit').onclick = ()=> frameScene();
+document.getElementById('toggleGrid').onclick = ()=> grid.visible = !grid.visible;
+document.getElementById('toggleAxes').onclick = ()=> axes.visible = !axes.visible;
+
+fileInput.onchange = (e)=> handleFiles(e.target.files);
+window.addEventListener('dragover', e=> e.preventDefault());
+window.addEventListener('drop', e=> { e.preventDefault(); if (e.dataTransfer?.files) handleFiles(e.dataTransfer.files); });
+
+function handleFiles(fileList){
+  const files = [...fileList];
+  const glb = files.find(f=>/\.(glb|gltf)$/i.test(f.name));
+  const gj  = files.find(f=>/\.(geojson|json)$/i.test(f.name));
+  const img = files.find(f=>/\.(png|jpg|jpeg)$/i.test(f.name));
+  if (glb) loadGLB(glb);
+  if (gj)  loadGeoJSON(gj);
+  if (img) loadFloorImage(img);
+}
+
+/* render loop */
+function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); }
+loop();
+
+/* resize */
+window.addEventListener('resize', ()=>{
+  const w=container.clientWidth, h=container.clientHeight;
+  renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>
